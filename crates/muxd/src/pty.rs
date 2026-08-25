@@ -158,6 +158,21 @@ pub fn spawn(params: &Spawn) -> Result<Pty> {
     // way the renderer itself would (the daemon's own environment has no
     // COLORTERM, and the child inherits it otherwise).
     let colorterm = CString::new("COLORTERM=truecolor")?;
+    // ncurses/readline resolve TERM=xterm-ghostty via TERMINFO, which is
+    // absent from every system terminfo db (it only ships inside Ghostty.app
+    // and Mux.app's own bundles). Without it the pane shell can't find kbs
+    // (key_backspace = \177) and erase rendering breaks: backspace prints a
+    // space instead of deleting. GHOSTTY_RESOURCES_DIR (set by main.swift,
+    // e.g. .../Resources/ghostty) is the one thing the daemon's env is
+    // guaranteed to carry; terminfo lives at the sibling path
+    // .../Resources/terminfo (same layout make-app.sh assembles).
+    let terminfo = std::env::var_os("GHOSTTY_RESOURCES_DIR").and_then(|dir| {
+        use std::os::unix::ffi::OsStringExt;
+        let sibling = PathBuf::from(dir).parent()?.join("terminfo");
+        let mut bytes = b"TERMINFO=".to_vec();
+        bytes.extend(sibling.into_os_string().into_vec());
+        CString::new(bytes).ok()
+    });
 
     // Everything below is built BEFORE fork. The daemon runs a
     // multithreaded runtime, so the child may only make
@@ -167,12 +182,15 @@ pub fn spawn(params: &Spawn) -> Result<Pty> {
     let exec_path = resolve_in_path(exec_path);
     let mut env: Vec<CString> = std::env::vars_os()
         .filter(|(k, _)| match k.to_str() {
-            // TERM/COLORTERM are re-added below. CLAUDE*/AI_AGENT are
-            // per-session markers of whatever agent happened to start the
-            // daemon; leaking them makes every pane shell look like a
+            // TERM/COLORTERM/TERMINFO are re-added below. CLAUDE*/AI_AGENT
+            // are per-session markers of whatever agent happened to start
+            // the daemon; leaking them makes every pane shell look like a
             // nested agent session (e.g. claude disables transcript
             // saving under CLAUDE_CODE_CHILD_SESSION).
-            Some(k) => !matches!(k, "TERM" | "COLORTERM" | "AI_AGENT") && !k.starts_with("CLAUDE"),
+            Some(k) => {
+                !matches!(k, "TERM" | "COLORTERM" | "TERMINFO" | "AI_AGENT")
+                    && !k.starts_with("CLAUDE")
+            }
             None => true,
         })
         .filter_map(|(k, v)| {
@@ -185,6 +203,9 @@ pub fn spawn(params: &Spawn) -> Result<Pty> {
         .collect();
     env.push(term);
     env.push(colorterm);
+    if let Some(terminfo) = terminfo {
+        env.push(terminfo);
+    }
     let envp: Vec<*const libc::c_char> = env
         .iter()
         .map(|e| e.as_ptr())
